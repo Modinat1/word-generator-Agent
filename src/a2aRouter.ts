@@ -258,6 +258,7 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
               ],
               messageId: randomUUID(),
               taskId: taskId,
+              contextId,
             },
           },
           artifacts,
