@@ -1,18 +1,6 @@
 import { registerApiRoute } from "@mastra/core/server";
 import { randomUUID } from "crypto";
-import { wordAgent } from "./mastra/agents/word-agent.js";
-
-interface ArtifactPart {
-  kind: "text" | "data";
-  text?: string;
-  data?: unknown;
-}
-
-interface Artifact {
-  artifactId: string;
-  name: string;
-  parts: ArtifactPart[];
-}
+import { wordAgent } from "../src/mastra/agents/word-agent";
 
 interface MessagePart {
   kind: "text" | "data";
@@ -21,10 +9,10 @@ interface MessagePart {
 }
 
 interface Message {
+  kind: string;
   role: string;
   parts: MessagePart[];
   messageId?: string;
-  taskId?: string;
 }
 
 export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
@@ -36,7 +24,6 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
       const body = await c.req.json();
       const { jsonrpc, id: requestId, method, params } = body;
 
-      //  Validate JSON-RPC 2.0 request
       if (jsonrpc !== "2.0" || !requestId) {
         return c.json(
           {
@@ -52,136 +39,307 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
         );
       }
 
-      // Extract user input
-      let action = "";
-      let context = "general";
-      let formalityLevel = "neutral";
+      let agentResponseText = "";
+      let userMessage = "";
 
+      // Handle different A2A methods
       if (method === "message/send") {
-        const messageParts = params?.message?.parts || [];
-        const textParts = messageParts.filter((p: any) => p.kind === "text");
-        const userMessageText = textParts
-          .map((p: any) => p.text)
-          .join(" ")
-          .trim();
+        // Standard A2A message format
+        const { message, configuration } = params || {};
 
-        // Basic heuristic: use the first few words as the "action"
-        // You can improve this parsing logic later if needed
-        action = userMessageText || "unspecified action";
-      } else if (method === "agent:run") {
-        const { input } = params || {};
-        action = input?.action || "";
-        context = input?.context || "general";
-        formalityLevel = input?.formalityLevel || "neutral";
-      }
-
-      // Validate required field
-      if (!action) {
-        return c.json(
-          {
-            jsonrpc: "2.0",
-            id: requestId,
-            error: {
-              code: -32602,
-              message: 'Invalid params: "action" is required in input',
-            },
-          },
-          400
-        );
-      }
-
-      //  Process the request using your wordAgent or a default agent
-      let agentText = "";
-      const taskId = randomUUID();
-      const contextId = randomUUID();
-
-      if (agentId === "wordAgent") {
-        const prompt = `Please find words for the action "${action}"${
-          context ? ` in the context of "${context}"` : ""
-        }${formalityLevel ? ` with ${formalityLevel} formality level` : ""}.`;
-
-        const response = await wordAgent.generate(prompt);
-        agentText = response.text;
-      } else {
-        const agent = mastra.getAgent(agentId);
-        if (!agent) {
+        if (!message || !message.parts) {
           return c.json(
             {
               jsonrpc: "2.0",
               id: requestId,
               error: {
                 code: -32602,
-                message: `Agent '${agentId}' not found`,
+                message: 'Invalid params: "message" with "parts" is required',
               },
             },
-            404
+            400
           );
         }
 
-        const response = await agent.generate([
-          { role: "user", content: action },
-        ]);
-        agentText = response.text || "";
-      }
+        // Extract text from message parts
+        userMessage = message.parts
+          .filter((part: MessagePart) => part.kind === "text" && part.text)
+          .map((part: MessagePart) => part.text)
+          .join(" ");
 
-      // Build artifacts and history for A2A response
-      const artifacts = [
-        {
-          artifactId: randomUUID(),
-          name: `${agentId}Response`,
-          parts: [{ kind: "text", text: agentText }],
-        },
-      ];
+        // Process with wordAgent
+        if (agentId === "wordAgent") {
+          try {
+            const response = await wordAgent.generate(userMessage);
+            agentResponseText = response.text;
+          } catch (agentError: any) {
+            console.error("Agent error:", agentError.message);
+            throw agentError;
+          }
+        } else {
+          // Use other Mastra agents
+          const agent = mastra.getAgent(agentId);
+          if (!agent) {
+            return c.json(
+              {
+                jsonrpc: "2.0",
+                id: requestId,
+                error: {
+                  code: -32602,
+                  message: `Agent '${agentId}' not found`,
+                },
+              },
+              404
+            );
+          }
 
-      const history = [
-        {
-          kind: "message",
-          role: "user",
-          parts: [{ kind: "text", text: action }],
-          messageId: randomUUID(),
-          taskId,
-        },
-        {
-          kind: "message",
-          role: "agent",
-          parts: [{ kind: "text", text: agentText }],
-          messageId: randomUUID(),
-          taskId,
-        },
-      ];
+          const response = await agent.generate(userMessage);
+          agentResponseText = response.text || "";
+        }
 
-      // Return fully A2A-compliant JSON-RPC response
-      return c.json({
-        jsonrpc: "2.0",
-        id: requestId,
-        result: {
-          id: taskId,
-          contextId,
-          status: {
-            state: "completed",
-            timestamp: new Date().toISOString(),
-            message: {
+        // Handle push notifications if blocking is false
+        const isBlocking = configuration?.blocking !== false;
+
+        if (!isBlocking && configuration?.pushNotificationConfig) {
+          // For non-blocking requests, send notification asynchronously
+          const { url, token } = configuration.pushNotificationConfig;
+
+          // Send immediate acknowledgment
+          const taskId = randomUUID();
+
+          // Process in background
+          processAndNotify(
+            url,
+            token,
+            taskId,
+            agentResponseText,
+            message.parts,
+            message.messageId
+          ).catch(console.error);
+
+          return c.json({
+            jsonrpc: "2.0",
+            id: requestId,
+            result: {
+              id: taskId,
+              contextId: message.messageId || randomUUID(),
+              status: {
+                state: "pending",
+                timestamp: new Date().toISOString(),
+              },
+              kind: "task",
+            },
+          });
+        }
+
+        // Blocking request - return immediately with full A2A structure
+        const taskId = randomUUID();
+        const contextId = message.messageId || randomUUID();
+        const messageId = randomUUID();
+
+        // Build artifacts array
+        const artifacts = [
+          {
+            artifactId: randomUUID(),
+            name: `${agentId}Response`,
+            parts: [{ kind: "text", text: agentResponseText }],
+          },
+        ];
+
+        // Build history array
+        const history = [
+          {
+            messageId: message.messageId || randomUUID(),
+            role: "user",
+            parts: message.parts,
+            kind: "message",
+          },
+          {
+            messageId,
+            role: "agent",
+            parts: [{ kind: "text", text: agentResponseText }],
+            kind: "message",
+          },
+        ];
+
+        return c.json({
+          jsonrpc: "2.0",
+          id: requestId,
+          result: {
+            id: taskId,
+            contextId: contextId,
+            status: {
+              state: "completed",
+              timestamp: new Date().toISOString(),
+              message: {
+                messageId,
+                role: "agent",
+                parts: [{ kind: "text", text: agentResponseText }],
+                kind: "message",
+              },
+            },
+            artifacts,
+            history,
+            kind: "task",
+          },
+        });
+      } else if (method === "agent:run") {
+        // Custom method for direct agent invocation (your original format)
+        const { input, messages } = params || {};
+
+        if (input && input.action) {
+          // Structured input format
+          const { action, context, formalityLevel } = input;
+          userMessage = `Find words for "${action}"${context ? ` in context: ${context}` : ""}${formalityLevel ? ` (${formalityLevel} formality)` : ""}`;
+        } else if (messages && messages.length > 0) {
+          // Messages array format
+          userMessage = messages
+            .filter((msg: any) => msg.role === "user")
+            .map(
+              (msg: any) =>
+                msg.content || msg.parts?.map((p: any) => p.text).join(" ")
+            )
+            .join(" ");
+        } else {
+          return c.json(
+            {
+              jsonrpc: "2.0",
+              id: requestId,
+              error: {
+                code: -32602,
+                message:
+                  'Invalid params: either "input.action" or "messages" is required',
+              },
+            },
+            400
+          );
+        }
+
+        // Process with agent
+        if (agentId === "wordAgent") {
+          const response = await wordAgent.generate(userMessage);
+          agentResponseText = response.text;
+        } else {
+          const agent = mastra.getAgent(agentId);
+          if (!agent) {
+            return c.json(
+              {
+                jsonrpc: "2.0",
+                id: requestId,
+                error: {
+                  code: -32602,
+                  message: `Agent '${agentId}' not found`,
+                },
+              },
+              404
+            );
+          }
+          const response = await agent.generate(userMessage);
+          agentResponseText = response.text || "";
+        }
+
+        const taskId = randomUUID();
+        const contextId = randomUUID();
+        const messageId = randomUUID();
+
+        // Build artifacts array
+        const artifacts = [
+          {
+            artifactId: randomUUID(),
+            name: `${agentId}Response`,
+            parts: [{ kind: "text", text: agentResponseText }],
+          },
+        ];
+
+        // Build history array based on input format
+        const history = [];
+
+        if (input && input.action) {
+          // For structured input, create synthetic history
+          history.push(
+            {
               messageId: randomUUID(),
-              role: "agent",
-              parts: [{ kind: "text", text: agentText }],
+              role: "user",
+              parts: [{ kind: "text", text: userMessage }],
               kind: "message",
             },
+            {
+              messageId,
+              role: "agent",
+              parts: [{ kind: "text", text: agentResponseText }],
+              kind: "message",
+            }
+          );
+        } else if (messages && messages.length > 0) {
+          // For messages array, convert to history format
+          messages.forEach((msg: any) => {
+            history.push({
+              messageId: randomUUID(),
+              role: msg.role,
+              parts: msg.parts || [{ kind: "text", text: msg.content }],
+              kind: "message",
+            });
+          });
+          // Add agent response
+          history.push({
+            messageId,
+            role: "agent",
+            parts: [{ kind: "text", text: agentResponseText }],
+            kind: "message",
+          });
+        }
+
+        return c.json({
+          jsonrpc: "2.0",
+          id: requestId,
+          result: {
+            id: taskId,
+            contextId: contextId,
+            status: {
+              state: "completed",
+              timestamp: new Date().toISOString(),
+              message: {
+                messageId,
+                role: "agent",
+                parts: [{ kind: "text", text: agentResponseText }],
+                kind: "message",
+              },
+            },
+            artifacts,
+            history,
+            kind: "task",
           },
-          artifacts,
-          history,
-          kind: "task",
-        },
-      });
+        });
+      } else {
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            id: requestId,
+            error: {
+              code: -32601,
+              message: `Method '${method}' not found. Supported: message/send, agent:run`,
+            },
+          },
+          404
+        );
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Internal error";
+      const errMsg = error instanceof Error ? error.message : "Internal Error";
+      const errStack = error instanceof Error ? error.stack : "";
+      console.error("A2A route error:", errMsg);
+      console.error("Stack:", errStack);
+
       return c.json(
         {
           jsonrpc: "2.0",
           id: null,
           error: {
             code: -32603,
-            message,
-            data: { details: message },
+            message: errMsg,
+            data: {
+              stack:
+                process.env.NODE_ENV === "development" ? errStack : undefined,
+            },
           },
         },
         500
@@ -190,320 +348,72 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
   },
 });
 
-// export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
-//   method: "POST",
-//   handler: async (c) => {
-//     try {
-//       const mastra = c.get("mastra");
-//       const agentId = c.req.param("agentId");
-//       const body = await c.req.json();
-//       const { jsonrpc, id: requestId, method, params } = body;
+// Helper function to send push notifications for non-blocking requests
+async function processAndNotify(
+  url: string,
+  token: string,
+  taskId: string,
+  responseText: string,
+  userParts: MessagePart[],
+  userMessageId?: string
+) {
+  try {
+    const agentMessageId = randomUUID();
 
-//       // Validate JSON-RPC 2.0 format
-//       if (jsonrpc !== "2.0" || !requestId) {
-//         return c.json(
-//           {
-//             jsonrpc: "2.0",
-//             id: requestId || null,
-//             error: {
-//               code: -32600,
-//               message:
-//                 'Invalid Request: "jsonrpc" must be "2.0" and "id" is required',
-//             },
-//           },
-//           400
-//         );
-//       }
+    // Build artifacts
+    const artifacts = [
+      {
+        artifactId: randomUUID(),
+        name: "wordAgentResponse",
+        parts: [{ kind: "text", text: responseText }],
+      },
+    ];
 
-//       const { messages, input } = params || {};
-//       let agentResponseText = "";
+    // Build history
+    const history = [
+      {
+        messageId: userMessageId || randomUUID(),
+        role: "user",
+        parts: userParts,
+        kind: "message",
+      },
+      {
+        messageId: agentMessageId,
+        role: "agent",
+        parts: [{ kind: "text", text: responseText }],
+        kind: "message",
+      },
+    ];
 
-//       if (agentId === "wordAgent") {
-//         const { action, context, formalityLevel } = input || {};
+    const notification = {
+      id: taskId,
+      contextId: userMessageId || randomUUID(),
+      status: {
+        state: "completed",
+        timestamp: new Date().toISOString(),
+        message: {
+          messageId: agentMessageId,
+          role: "agent",
+          parts: [{ kind: "text", text: responseText }],
+          kind: "message",
+        },
+      },
+      artifacts,
+      history,
+      kind: "task",
+    };
 
-//         if (!action) {
-//           return c.json(
-//             {
-//               jsonrpc: "2.0",
-//               id: requestId,
-//               error: {
-//                 code: -32602,
-//                 message: 'Invalid params: "action" is required in input',
-//               },
-//             },
-//             400
-//           );
-//         }
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(notification),
+    });
 
-//         const prompt = `Please find words for the action "${action}"${context ? ` in the context of "${context}"` : ""}${formalityLevel ? ` with ${formalityLevel} formality level` : ""}.`;
-
-//         try {
-//           const response = await wordAgent.generate(prompt);
-//           agentResponseText = response.text;
-//         } catch (agentError: any) {
-//           throw agentError;
-//         }
-//       } else {
-//         // Default Mastra agent (if not wordAgent)
-//         const agent = mastra.getAgent(agentId);
-//         if (!agent) {
-//           return c.json(
-//             {
-//               jsonrpc: "2.0",
-//               id: requestId,
-//               error: { code: -32602, message: `Agent '${agentId}' not found` },
-//             },
-//             404
-//           );
-//         }
-
-//         const mastraMessages = (messages || []).map((msg: Message) => ({
-//           role: msg.role,
-//           content: msg.parts.map((p) => p.text || "").join(" "),
-//         }));
-
-//         const response = await agent.generate(mastraMessages);
-//         agentResponseText = response.text || "";
-//       }
-
-//       // JSON-RPC 2.0 response
-//       const artifactId = randomUUID();
-//       const taskId = randomUUID();
-
-//       return c.json({
-//         jsonrpc: "2.0",
-//         id: requestId,
-//         result: {
-//           id: taskId,
-//           contextId: randomUUID(),
-//           status: {
-//             state: "completed",
-//             timestamp: new Date().toISOString(),
-//             message: {
-//               messageId: randomUUID(),
-//               role: "agent",
-//               parts: [{ kind: "text", text: agentResponseText }],
-//               kind: "message",
-//             },
-//           },
-//           artifacts: [
-//             {
-//               artifactId,
-//               name: `${agentId}Response`,
-//               parts: [{ kind: "text", text: agentResponseText }],
-//             },
-//           ],
-//           kind: "task",
-//         },
-//       });
-//     } catch (error) {
-//       const errorMessage =
-//         error instanceof Error ? error.message : "Internal Error";
-//       const errorStack = error instanceof Error ? error.stack : "";
-//       console.error("A2A route error:", errorMessage);
-//       console.error("Stack:", errorStack);
-
-//       return c.json(
-//         {
-//           jsonrpc: "2.0",
-//           id: null,
-//           error: {
-//             code: -32603,
-//             message: errorMessage,
-//             data: { stack: errorStack },
-//           },
-//         },
-//         500
-//       );
-//     }
-//   },
-// });
-
-// import { registerApiRoute } from "@mastra/core/server";
-// import { randomUUID } from "crypto";
-// import { wordAgent } from "./mastra/agents/word-agent.js";
-
-// export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
-//   method: "POST",
-//   handler: async (c) => {
-//     try {
-//       const mastra = c.get("mastra");
-//       const agentId = c.req.param("agentId");
-
-//       // Parse JSON-RPC 2.0 request
-//       const body = await c.req.json();
-//       const { jsonrpc, id: requestId, method, params } = body;
-
-//       // Validate JSON-RPC 2.0 format
-//       if (jsonrpc !== "2.0" || !requestId) {
-//         return c.json(
-//           {
-//             jsonrpc: "2.0",
-//             id: requestId || null,
-//             error: {
-//               code: -32600,
-//               message:
-//                 'Invalid Request: jsonrpc must be "2.0" and id is required',
-//             },
-//           },
-//           400
-//         );
-//       }
-
-//       const { message, messages, input, contextId, taskId, metadata } =
-//         params || {};
-
-//       // Determine message list
-//       let messagesList = [];
-//       if (message) {
-//         messagesList = [message];
-//       } else if (messages && Array.isArray(messages)) {
-//         messagesList = messages;
-//       }
-
-//       let agentResponseText = "";
-
-//       // Handle wordAgent specifically
-//       if (agentId === "wordAgent") {
-//         const { action, context, formalityLevel } = input || {};
-
-//         if (!action) {
-//           return c.json(
-//             {
-//               jsonrpc: "2.0",
-//               id: requestId,
-//               error: {
-//                 code: -32602,
-//                 message: 'Invalid params: "action" is required in input',
-//               },
-//             },
-//             400
-//           );
-//         }
-
-//         const prompt = `Please find words for the action "${action}"${
-//           context ? ` in the context of "${context}"` : ""
-//         }${formalityLevel ? ` with ${formalityLevel} formality level` : ""}.`;
-
-//         try {
-//           const response = await wordAgent.generate(prompt);
-//           agentResponseText = response.text;
-//         } catch (err: any) {
-//           throw err;
-//         }
-//       } else {
-//         // Use a Mastra agent if not wordAgent
-//         const agent = mastra.getAgent(agentId);
-//         if (!agent) {
-//           return c.json(
-//             {
-//               jsonrpc: "2.0",
-//               id: requestId,
-//               error: {
-//                 code: -32602,
-//                 message: `Agent '${agentId}' not found`,
-//               },
-//             },
-//             404
-//           );
-//         }
-
-//         // Convert messages into Mastra format
-//         const mastraMessages = messagesList.map((msg) => ({
-//           role: msg.role,
-//           content:
-//             msg.parts
-//               ?.map((part) =>
-//                 part.kind === "text"
-//                   ? part.text
-//                   : part.kind === "data"
-//                     ? JSON.stringify(part.data)
-//                     : ""
-//               )
-//               .join("\n") || "",
-//         }));
-
-//         const response = await agent.generate(mastraMessages);
-//         agentResponseText = response.text || "";
-//       }
-
-//       // Build artifacts
-//       const artifacts = [
-//         {
-//           artifactId: randomUUID(),
-//           name: `${agentId}Response`,
-//           parts: [{ kind: "text", text: agentResponseText }],
-//         },
-//       ];
-
-//       // Include tool results if available
-//       const agent = mastra.getAgent(agentId);
-//       const agentResponse = agent && (await agent.generate(messagesList));
-//       if (agentResponse?.toolResults?.length > 0) {
-//         artifacts.push({
-//           artifactId: randomUUID(),
-//           name: "ToolResults",
-//           parts: agentResponse.toolResults.map((result: any) => ({
-//             kind: "data",
-//             data: result,
-//           })),
-//         });
-//       }
-
-//       // Conversation history
-//       const history = [
-//         ...messagesList.map((msg) => ({
-//           kind: "message",
-//           role: msg.role,
-//           parts: msg.parts,
-//           messageId: msg.messageId || randomUUID(),
-//           taskId: msg.taskId || taskId || randomUUID(),
-//         })),
-//         {
-//           kind: "message",
-//           role: "agent",
-//           parts: [{ kind: "text", text: agentResponseText }],
-//           messageId: randomUUID(),
-//           taskId: taskId || randomUUID(),
-//         },
-//       ];
-
-//       // Return A2A-compliant JSON-RPC response
-//       return c.json({
-//         jsonrpc: "2.0",
-//         id: requestId,
-//         result: {
-//           id: taskId || randomUUID(),
-//           contextId: contextId || randomUUID(),
-//           status: {
-//             state: "completed",
-//             timestamp: new Date().toISOString(),
-//             message: {
-//               messageId: randomUUID(),
-//               role: "agent",
-//               parts: [{ kind: "text", text: agentResponseText }],
-//               kind: "message",
-//             },
-//           },
-//           artifacts,
-//           history,
-//           kind: "task",
-//         },
-//       });
-//     } catch (error: any) {
-//       console.error("A2A route error:", error.message);
-//       return c.json(
-//         {
-//           jsonrpc: "2.0",
-//           id: null,
-//           error: {
-//             code: -32603,
-//             message: "Internal error",
-//             data: { details: error.message },
-//           },
-//         },
-//         500
-//       );
-//     }
-//   },
-// });
+    console.log("Push notification sent successfully");
+  } catch (error) {
+    console.error("Failed to send push notification:", error);
+  }
+}
