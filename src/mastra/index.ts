@@ -8,7 +8,7 @@ import {
   toolCallAppropriatenessScorer,
   completenessScorer,
 } from "./scorers/word-scorer";
-import { a2aAgentRoute } from "./a2aRouter";
+import { a2aAgentRoute } from "../a2aRouter";
 
 export const mastra = new Mastra({
   workflows: { wordWorkflow },
