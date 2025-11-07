@@ -64,15 +64,11 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
         );
       }
 
-      // --- Prepare input for your Mastra agent ---
+      // --- Prepare input for Mastra agent ---
       const input = {
         action: userText,
         context: userText,
       };
-
-      // console.log(
-      //   `[a2aAgentRoute] Received text: "${userText}" for agent=${agentId}`
-      // );
 
       // --- Resolve agent ---
       const agent =
@@ -110,6 +106,22 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
         throw new Error("Agent does not support run() or generate()");
       }
 
+      // --- Build artifact from the agent response ---
+      const artifactId = randomUUID();
+      const artifacts = [
+        {
+          artifactId,
+          name: `${agentId}-response-artifact`,
+          createdAt: new Date().toISOString(),
+          parts: [
+            {
+              kind: "text",
+              text: agentText,
+            },
+          ],
+        },
+      ];
+
       // --- Build A2A Telex-style response ---
       const taskId = randomUUID();
       const contextId = randomUUID();
@@ -128,12 +140,19 @@ export const a2aAgentRoute = registerApiRoute("/a2a/agent/:agentId", {
                 kind: "text",
                 text: agentText,
               },
+              {
+                kind: "data",
+                data: {
+                  artifacts,
+                },
+              },
             ],
             messageId,
             taskId,
             contextId,
           },
         },
+        artifacts,
         kind: "task",
       };
 
